@@ -1,1 +1,7 @@
 .claude
+vendor/
+models/
+outputs/
+data/
+__pycache__/
+*.pyc
