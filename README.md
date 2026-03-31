@@ -199,6 +199,98 @@ A 60% classification accuracy on financial time series is considered excellent. 
 
 ---
 
+## Using the Trained Model
+
+Once you have run both scripts, the trained models sit in `models/`. Here is how to load them and get a forecast for a new day.
+
+### What you need as input
+
+To forecast for **tomorrow**, you need today's feature row — the same 22 columns the model was trained on. The easiest way is to pull the last row from `final_features.parquet` after running the pipeline on fresh data.
+
+```python
+import pandas as pd
+import xgboost as xgb
+import numpy as np
+
+FEATURE_COLS = [
+    "GARCH_Forecast", "GARCH_Residual_lag1", "GARCH_Residual_lag2",
+    "ATM_IV", "ATM_IV_lag1", "ATM_IV_lag2", "ATM_IV_5d_mean",
+    "Skew", "Skew_lag1", "TS_Slope", "IV_HV_Spread",
+    "OI_Change", "OI_Change_lag1", "PCR_OI", "Volume_Change", "PCR_Volume",
+    "DTE_nearest", "Is_expiry_week", "Days_since_last_expiry",
+    "HV_10", "HV_20", "HV_30",
+]
+
+# Load today's features (last row of the pipeline output)
+features = pd.read_parquet("data/features/final_features.parquet")
+today = features[FEATURE_COLS].iloc[[-1]]  # shape (1, 22)
+```
+
+### Get the classification signal
+
+The classifier tells you whether GARCH is likely **underestimating** tomorrow's volatility.
+
+```python
+clf = xgb.XGBClassifier()
+clf.load_model("models/xgb_classifier.ubj")
+
+predicted_class = clf.predict(today)[0]
+probability     = clf.predict_proba(today)[0][1]
+
+if predicted_class == 1:
+    print(f"GARCH likely UNDERESTIMATES tomorrow's vol  (confidence: {probability:.1%})")
+else:
+    print(f"GARCH likely OVERESTIMATES tomorrow's vol  (confidence: {1 - probability:.1%})")
+```
+
+### Get the corrected volatility forecast
+
+The regressor predicts the exact correction to apply on top of GARCH's forecast.
+
+```python
+reg = xgb.XGBRegressor()
+reg.load_model("models/xgb_regressor.ubj")
+
+garch_forecast  = features["GARCH_Forecast"].iloc[-1]
+xgb_correction  = reg.predict(today)[0]
+final_forecast  = garch_forecast + xgb_correction
+
+print(f"GARCH forecast:          {garch_forecast*100:.3f}%")
+print(f"XGBoost correction:      {xgb_correction*100:+.3f}%")
+print(f"Final vol forecast:      {final_forecast*100:.3f}%")
+print(f"Annualized (x sqrt252):  {final_forecast * np.sqrt(252) * 100:.2f}%")
+```
+
+### Practical workflow for live use
+
+```
+Every evening after market close:
+  1. Download today's NSE BANKNIFTY options bhavcopy
+  2. Append it to BANK_NIFTY_Data1/ as a new or updated monthly file
+  3. Run: python preprocess.py
+  4. Run the 3 code blocks above to get tomorrow's forecast
+```
+
+> **Retrain periodically.** Re-run `xgboost_volatility_model.py` every month or two as you accumulate more data. Update `TRAIN_END` and `VAL_END` to reflect the new date range before retraining.
+
+### Reading `outputs/test_set_forecasts.csv`
+
+This file shows the model's performance day-by-day on the held-out test set:
+
+| Column | Description |
+|--------|-------------|
+| `GARCH_Forecast` | Raw GARCH one-day-ahead vol forecast |
+| `GARCH_Error` | How wrong GARCH was (realized − forecast) |
+| `Realized_Vol_proxy` | Actual realized volatility for that day |
+| `Target_Binary` | Ground truth (1 = GARCH underestimated) |
+| `XGB_Predicted_Class` | Model's prediction (1 or 0) |
+| `XGB_Pred_Probability` | Confidence score (0–1) for class 1 |
+| `XGB_Correction` | Correction the regressor applied |
+| `Final_Forecast` | `GARCH_Forecast + XGB_Correction` |
+| `Correct_Direction` | 1 if the model predicted direction correctly |
+
+---
+
 ## Inspect Parquet Files
 
 To quickly inspect any intermediate dataset:
