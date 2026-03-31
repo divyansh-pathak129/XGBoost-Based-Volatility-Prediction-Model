@@ -38,8 +38,9 @@ stockspipeline/
 │   ├── raw/                         # master_raw.parquet
 │   ├── processed/                   # master_filtered.parquet, master_with_iv.parquet
 │   └── features/                    # final_features.parquet, final_features.csv
+├── assets/                          # Output plots (committed for README display)
 ├── models/                          # Trained XGBoost models (.ubj, .pkl)
-├── outputs/                         # Plots and forecast CSV
+├── outputs/                         # Plots and forecast CSV (gitignored)
 └── .gitignore
 ```
 
@@ -116,6 +117,56 @@ This runs all 8 model phases and writes:
 | `outputs/roc_curve.png` | ROC curve on test set |
 | `outputs/forecast_comparison.png` | GARCH vs GARCH+XGBoost vs realized vol |
 | `outputs/test_set_forecasts.csv` | Per-day forecasts with corrections on test set |
+
+---
+
+## Sample Outputs
+
+### EDA — ATM IV, GARCH vs Realized Vol, Skew, GARCH Error
+
+![EDA Signals](assets/eda_signals.png)
+
+---
+
+### Class Balance — GARCH Over vs Underestimation
+
+![Class Balance](assets/class_balance.png)
+
+---
+
+### Feature Correlation Matrix
+
+![Correlation Heatmap](assets/correlation_heatmap.png)
+
+---
+
+### Baseline XGBoost Feature Importances
+
+![Feature Importances](assets/feature_importances_baseline.png)
+
+---
+
+### SHAP — Global Feature Importance
+
+![SHAP Importance](assets/shap_importance.png)
+
+---
+
+### SHAP — Direction and Magnitude of Each Feature
+
+![SHAP Beeswarm](assets/shap_beeswarm.png)
+
+---
+
+### ROC Curve — Test Set
+
+![ROC Curve](assets/roc_curve.png)
+
+---
+
+### Forecast Comparison — GARCH vs GARCH+XGBoost vs Realized Vol
+
+![Forecast Comparison](assets/forecast_comparison.png)
 
 ---
 
