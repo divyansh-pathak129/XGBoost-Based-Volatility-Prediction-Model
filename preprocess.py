@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-DATA_DIR = "BANK_NIFTY_Data1"
+DATA_DIR = "BANKNIFTY"
 OUT_DIR = "data"
 RISK_FREE_RATE = 0.065          # RBI repo rate ~6.5%
 OI_MIN = 50                     # minimum OI contracts
@@ -644,7 +644,7 @@ def main():
     print("\n" + "=" * 60)
     print("PIPELINE COMPLETE")
     print(f"Final dataset shape: {final.shape}")
-    print(f"Date range: {final.index.min()} → {final.index.max()}")
+    print(f"Date range: {final.index.min()} -> {final.index.max()}")
     print(f"Features: {available_features}")
     print(f"Saved to: {OUT_DIR}/features/final_features.parquet + .csv")
     print("=" * 60)
