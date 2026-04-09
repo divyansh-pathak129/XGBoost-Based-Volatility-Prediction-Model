@@ -29,6 +29,7 @@ DTE_MAX = 90
 IV_MAX = 2.0                    # cap at 200% annualized
 MIN_ROWS_PER_DAY = 10
 GARCH_WARMUP = 60               # trading days for GARCH warmup
+GARCH_MODEL = "GJR-GARCH"      # "GARCH", "GJR-GARCH", or "EGARCH"
 N_JOBS = -1                     # parallel jobs for IV computation
 
 os.makedirs(f"{OUT_DIR}/raw", exist_ok=True)
@@ -41,44 +42,85 @@ os.makedirs(f"{OUT_DIR}/features", exist_ok=True)
 # ─────────────────────────────────────────────
 
 def fix_date_column(df, fname):
-    """Handle multiple date formats found across NSE monthly files:
-    - datetime64: already parsed (most files)
-    - int/float DDMMYY: e.g. 10226 → 01/02/26 → 2026-02-01  (FEB26 file)
-    - int Excel serial: e.g. 44197 → 2021-01-01 (fallback)
+    """Handle all date formats found across NSE monthly files:
+    - datetime64         : already parsed by pandas (ideal case)
+    - string DD-MM-YYYY  : e.g. "01-08-2025"  — Dataset1 newer files
+    - string DD/MM/YYYY  : e.g. "01/08/2025"  — alternate string variant
+    - int/float DDMMYY   : e.g. 10226         — NSE FEB26 quirk
+    - float Excel serial : e.g. 45139.0       — Dataset2 older files
     """
     col = df["Date"]
+
+    # Already datetime — nothing to do
     if pd.api.types.is_datetime64_any_dtype(col):
-        # Already proper datetime
         return df
 
-    # Try DDMMYY integer format first (NSE quirk seen in FEB26 file)
-    # Values look like 10226, 20226, ..., 270226  (max 6 digits for DDMMYY)
     non_null = col.dropna()
-    if len(non_null) and non_null.max() <= 9999999:
+    if len(non_null) == 0:
+        print(f"  [{fname}] WARNING: Date column is entirely null!")
+        return df
+
+    sample_val = non_null.iloc[0]
+
+    # Branch 1: string dates — check type BEFORE any numeric comparison
+    if isinstance(sample_val, str):
+        for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%b-%Y"):
+            parsed = pd.to_datetime(col, format=fmt, errors="coerce")
+            if parsed.notna().mean() > 0.8:
+                df["Date"] = parsed
+                print(f"  [{fname}] Parsed string dates (format='{fmt}'). "
+                      f"Sample: {df['Date'].dropna().iloc[0].date()}")
+                return df
+        # Fallback: let pandas infer
+        parsed = pd.to_datetime(col, errors="coerce")
+        df["Date"] = parsed
+        sample = df["Date"].dropna()
+        print(f"  [{fname}] Parsed string dates via auto-infer. "
+              f"Sample: {sample.iloc[0].date() if len(sample) else 'N/A'}")
+        return df
+
+    # Branch 2: numeric dates — now safe to call .max()
+    try:
+        numeric_max = float(non_null.max())
+    except (TypeError, ValueError):
+        df["Date"] = pd.to_datetime(col, errors="coerce")
+        print(f"  [{fname}] Date fallback parse (unknown type).")
+        return df
+
+    # Sub-branch 2a: DDMMYY 6-digit integer (max <= 9,999,999)
+    if numeric_max <= 9_999_999:
         try:
-            # Zero-pad to 6 chars → DDMMYY
-            date_strs = non_null.astype(float).astype("Int64").astype(str).str.zfill(6)
+            date_strs = (
+                col.astype(float).astype("Int64").astype(str).str.zfill(6)
+            )
             test = pd.to_datetime(date_strs, format="%d%m%y", errors="coerce")
-            valid_pct = test.notna().mean()
-            if valid_pct > 0.8:
-                df["Date"] = pd.to_datetime(
-                    col.dropna().astype(float).astype("Int64").astype(str).str.zfill(6),
-                    format="%d%m%y", errors="coerce"
-                ).reindex(df.index)
-                sample = df["Date"].dropna().iloc[0]
-                print(f"  [{fname}] Converted DDMMYY integer dates. Sample: {sample.date()}")
+            if test.notna().mean() > 0.8:
+                df["Date"] = test
+                print(f"  [{fname}] Converted DDMMYY integer dates. "
+                      f"Sample: {df['Date'].dropna().iloc[0].date()}")
                 return df
         except Exception:
             pass
 
-    # Fallback: Excel serial date (days since 1899-12-30)
-    try:
-        df["Date"] = pd.to_datetime(col, unit="D", origin="1899-12-30", errors="coerce")
-        sample = df["Date"].dropna().iloc[0]
-        print(f"  [{fname}] Converted Excel serial dates. Sample: {sample.date()}")
-    except Exception as e:
-        df["Date"] = pd.to_datetime(col, errors="coerce")
-        print(f"  [{fname}] Date fallback parse. Error was: {e}")
+    # Sub-branch 2b: Excel serial float (values > 40,000 = year 2009+)
+    if numeric_max > 40_000:
+        try:
+            parsed = pd.to_datetime(
+                col, unit="D", origin="1899-12-30", errors="coerce"
+            )
+            if parsed.notna().mean() > 0.8:
+                df["Date"] = parsed
+                print(f"  [{fname}] Converted Excel serial dates. "
+                      f"Sample: {df['Date'].dropna().iloc[0].date()}")
+                return df
+        except Exception as e:
+            print(f"  [{fname}] Excel serial conversion failed: {e}")
+
+    # Final fallback
+    df["Date"] = pd.to_datetime(col, errors="coerce")
+    sample = df["Date"].dropna()
+    print(f"  [{fname}] Date generic fallback. "
+          f"Sample: {sample.iloc[0].date() if len(sample) else 'N/A'}")
     return df
 
 
@@ -115,6 +157,19 @@ def load_all_files():
     # Drop rows with NaN in critical columns
     master = master.dropna(subset=["Date", "UNDRLNG_ST"])
     master = master[master["CLOSE_PRIC"].notna() | master["SETTLEMENT"].notna()]
+
+    # Per-file date range check — catches silent parse failures
+    date_summary = (
+        master.groupby("source_file")["Date"]
+        .agg(["min", "max", "count"])
+        .rename(columns={"min": "earliest", "max": "latest", "count": "valid_rows"})
+    )
+    print("\nDate range per source file (verify these look correct):")
+    print(date_summary.to_string())
+    bad_files = date_summary[date_summary["valid_rows"] < 100]
+    if len(bad_files):
+        print(f"\nWARNING: These files produced suspiciously few valid dates "
+              f"(date parsing likely failed): {bad_files.index.tolist()}")
 
     # Fill NaN OI with 0
     master["OI_NO_CON"] = master["OI_NO_CON"].fillna(0)
@@ -405,9 +460,20 @@ def build_daily_features(df):
     oi_change = total_oi.diff().rename("OI_Change")
 
     # ── 4.6 Volume Features ──
-    total_vol = df.groupby("Date")["TRADED_QUA"].sum().rename("Total_Volume")
-    put_vol = df[df["option_type"] == "PE"].groupby("Date")["TRADED_QUA"].sum().rename("Put_Volume")
-    call_vol = df[df["option_type"] == "CE"].groupby("Date")["TRADED_QUA"].sum().rename("Call_Volume")
+    # Detect volume column name robustly
+    _VOL_CANDIDATES = ["TRADED_QUA", "TRADED_QTY", "VOLUME", "TRDNG_VALUE"]
+    _vol_col = next((c for c in _VOL_CANDIDATES if c in df.columns), None)
+    if _vol_col is None:
+        print(f"  WARNING: No volume column found. Available: {list(df.columns)}")
+        print(f"  PCR_Volume and Volume_Change will be NaN.")
+        df["_vol_tmp"] = np.nan
+        _vol_col = "_vol_tmp"
+    else:
+        print(f"  Volume column detected: '{_vol_col}'")
+
+    total_vol = df.groupby("Date")[_vol_col].sum().rename("Total_Volume")
+    put_vol = df[df["option_type"] == "PE"].groupby("Date")[_vol_col].sum().rename("Put_Volume")
+    call_vol = df[df["option_type"] == "CE"].groupby("Date")[_vol_col].sum().rename("Call_Volume")
     pcr_vol = (put_vol / call_vol.replace(0, np.nan)).rename("PCR_Volume")
     vol_change = total_vol.diff().rename("Volume_Change")
 
@@ -458,7 +524,7 @@ def run_garch_rolling(daily):
         print("arch not installed — skipping GARCH. Run: pip install arch")
         return daily
 
-    print(f"\nRunning rolling GARCH with warmup={GARCH_WARMUP} days...")
+    print(f"\nRunning rolling {GARCH_MODEL} with warmup={GARCH_WARMUP} days...")
     returns = (daily["log_return"].dropna() * 100).sort_index()
     trading_days = returns.index.tolist()
     n = len(trading_days)
@@ -473,7 +539,13 @@ def run_garch_rolling(daily):
     for i in range(GARCH_WARMUP, n):
         train = returns.iloc[:i]
         try:
-            am = arch_model(train, vol="Garch", p=1, q=1, dist="t", rescale=False)
+            if GARCH_MODEL == "GJR-GARCH":
+                # Asymmetric GARCH: captures leverage effect (bad news raises vol more)
+                am = arch_model(train, vol="GARCH", p=1, o=1, q=1, dist="t", rescale=False)
+            elif GARCH_MODEL == "EGARCH":
+                am = arch_model(train, vol="EGARCH", p=1, q=1, dist="t", rescale=False)
+            else:
+                am = arch_model(train, vol="Garch", p=1, q=1, dist="t", rescale=False)
             res = am.fit(disp="off", show_warning=False)
             forecast = res.forecast(horizon=1)
             fc_var = forecast.variance.iloc[-1, 0]

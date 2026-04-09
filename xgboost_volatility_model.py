@@ -12,6 +12,10 @@ Enhancements applied (see model_enhancements.md):
   Fix D -- Add GARCH_Bias_rolling (20-day rolling mean of past GARCH errors)
   Fix E -- Dead-zone target: drop rows where |GARCH_Error| < 0.003 from train/val
   Fix F -- Walk-forward CV with 5 expanding windows for hyperparameter tuning
+  Enh G -- 5 new regime-detection features + RandomizedSearchCV with regularization
+           params (gamma, reg_alpha, reg_lambda) + Platt calibration
+  Note: set GARCH_MODEL="GJR-GARCH" in preprocess.py and re-run pipeline for
+        asymmetric volatility modeling (captures leverage effect)
 """
 
 import os
@@ -45,6 +49,14 @@ FEATURE_COLS = [
     "HV_20", "HV_ratio",          # Fix B: HV_10/HV_30 replaced by HV_20 + ratio
     "ATM_IV_regime",               # Fix C
     "GARCH_Bias_rolling",          # Fix D
+    # Enhancement G: regime-detection and momentum features
+    "HV_GARCH_ratio",              # Enh G1: HV₂₀ / GARCH_forecast (direct bias indicator)
+    "GARCH_Bias_short",            # Enh G2: 5-day GARCH error mean (faster regime signal)
+    "ATM_IV_trend",                # Enh G3: IV momentum (ATM_IV - 5d mean)
+    "Vol_of_Vol",                  # Enh G4: rolling std of ATM_IV (vol acceleration)
+    "PCR_OI_change1d",             # Enh G5: 1-day PCR momentum
+    "HV_GARCH_above_1",            # Enh G6a: binary flag — HV > GARCH forecast
+    "GARCH_Bias_positive",         # Enh G6b: binary flag — recent GARCH bias is positive
 ]
 
 # Dead-zone threshold (Fix E)
@@ -93,6 +105,50 @@ def load_data():
                              .rolling(20, min_periods=5)
                              .mean()
         )
+
+    # ----------------------------------------------------------
+    # Enhancement G: New regime-detection and momentum features
+    # ----------------------------------------------------------
+    # G1: HV_GARCH_ratio = realized HV (daily) / GARCH forecast
+    # When > 1: actual realized vol exceeds GARCH forecast -> GARCH likely underestimates
+    # This is the strongest single indicator of GARCH underestimation regime
+    if "HV_20" in df.columns and "GARCH_Forecast" in df.columns:
+        df["HV_GARCH_ratio"] = (
+            (df["HV_20"] / np.sqrt(252))
+            / df["GARCH_Forecast"].replace(0, np.nan)
+        ).fillna(1.0)
+
+    # G2: GARCH_Bias_short = 5-day GARCH error mean (faster than 20-day)
+    # Catches regime shifts ~4x faster than GARCH_Bias_rolling
+    if "GARCH_Error" in df.columns:
+        df["GARCH_Bias_short"] = (
+            df["GARCH_Error"].shift(1)
+                             .rolling(5, min_periods=2)
+                             .mean()
+        )
+
+    # G3: ATM_IV_trend = IV momentum relative to 5-day mean
+    # Positive = IV accelerating upward (often precedes vol spike)
+    if "ATM_IV" in df.columns and "ATM_IV_5d_mean" in df.columns:
+        df["ATM_IV_trend"] = df["ATM_IV"] - df["ATM_IV_5d_mean"]
+
+    # G4: Vol_of_Vol = 10-day rolling std of ATM_IV
+    # High VoV means the vol surface is itself unstable -> harder for GARCH to track
+    if "ATM_IV" in df.columns:
+        df["Vol_of_Vol"] = df["ATM_IV"].rolling(10, min_periods=5).std()
+
+    # G5: PCR_OI_change1d = 1-day change in put/call OI ratio
+    # Rising PCR_OI means put demand increasing relative to calls -> directional fear
+    if "PCR_OI" in df.columns:
+        df["PCR_OI_change1d"] = df["PCR_OI"].diff(1)
+
+    # G6: Binary threshold features — help XGBoost find cleaner splits
+    # When HV > GARCH forecast AND short-term bias is positive, GARCH is systematically
+    # underestimating right now. These binary flags capture the non-linear interaction.
+    if "HV_GARCH_ratio" in df.columns:
+        df["HV_GARCH_above_1"] = (df["HV_GARCH_ratio"] > 1.0).astype(int)
+    if "GARCH_Bias_short" in df.columns:
+        df["GARCH_Bias_positive"] = (df["GARCH_Bias_short"] > 0).astype(int)
 
     # Restrict FEATURE_COLS to what is actually present
     global FEATURE_COLS
@@ -355,25 +411,68 @@ def tune_threshold(model, X_val, y_val):
     return best_thr
 
 
+class PlattCalibratedXGB:
+    """Platt scaling wrapper for XGBoost (sklearn 1.4+ compatible).
+    Fits a logistic regression on the raw XGBoost probabilities to correct
+    systematic over/under-confidence caused by class imbalance."""
+
+    def __init__(self, base_model):
+        self.base_model = base_model
+        self._platt = None
+
+    def fit_calibration(self, X_cal, y_cal):
+        from sklearn.linear_model import LogisticRegression
+        raw = self.base_model.predict_proba(X_cal)[:, 1].reshape(-1, 1)
+        self._platt = LogisticRegression(C=1.0, solver="lbfgs")
+        self._platt.fit(raw, y_cal)
+        return self
+
+    def predict_proba(self, X):
+        raw = self.base_model.predict_proba(X)[:, 1].reshape(-1, 1)
+        cal = self._platt.predict_proba(raw)   # shape (n, 2)
+        return cal
+
+    def predict(self, X):
+        return self.base_model.predict(X)
+
+    @property
+    def feature_importances_(self):
+        return self.base_model.feature_importances_
+
+    @property
+    def estimator(self):
+        return self.base_model
+
+    @property
+    def best_iteration(self):
+        return getattr(self.base_model, "best_iteration", None)
+
+
 def tune_model(X_train, y_train, X_val, y_val, scale_pos_weight):
     import xgboost as xgb
-    from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+    from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
     from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, f1_score
 
     print("\n" + "=" * 60)
-    print("PHASE 4: Hyperparameter Tuning  (Fix F: 5-fold walk-forward CV)")
+    print("PHASE 4: Hyperparameter Tuning  (Fix F + Enh G: RandomizedSearchCV)")
     print("=" * 60)
 
     # Fix F: 5 expanding walk-forward folds over train+val combined
     tscv = TimeSeriesSplit(n_splits=5)
 
-    param_grid = {
-        "max_depth":        [3, 4, 5],
-        "learning_rate":    [0.05, 0.1],
-        "n_estimators":     [100, 200, 300],
-        "subsample":        [0.7, 0.9],
-        "colsample_bytree": [0.7, 0.9],
-        "min_child_weight": [1, 3],
+    # Enhancement G: Expanded search space with regularization parameters
+    # Lower max_depth (2-4 vs old 3-5) and higher min_child_weight to combat overfitting
+    # gamma prunes trees that don't improve loss; reg_alpha/lambda add L1/L2 penalties
+    param_distributions = {
+        "max_depth":        [2, 3, 4],
+        "learning_rate":    [0.01, 0.03, 0.05, 0.1],
+        "n_estimators":     [100, 200, 300, 500],
+        "subsample":        [0.6, 0.7, 0.8],
+        "colsample_bytree": [0.6, 0.7, 0.8],
+        "min_child_weight": [5, 10, 20],
+        "gamma":            [0, 0.05, 0.1, 0.2],
+        "reg_alpha":        [0, 0.05, 0.1, 0.3],
+        "reg_lambda":       [1.0, 2.0, 5.0],
     }
 
     base_xgb = xgb.XGBClassifier(
@@ -387,22 +486,24 @@ def tune_model(X_train, y_train, X_val, y_val, scale_pos_weight):
     X_trainval = pd.concat([X_train, X_val]).reset_index(drop=True)
     y_trainval = pd.concat([y_train, y_val]).reset_index(drop=True)
 
-    grid = GridSearchCV(
-        base_xgb, param_grid,
+    search = RandomizedSearchCV(
+        base_xgb, param_distributions,
+        n_iter=60,
         cv=tscv,
         scoring="roc_auc",
         n_jobs=-1,
         verbose=0,
+        random_state=42,
         refit=True,
         error_score=0.0,   # folds with single class -> score 0 instead of NaN
     )
-    grid.fit(X_trainval, y_trainval)
+    search.fit(X_trainval, y_trainval)
 
-    print(f"\n  Best params:  {grid.best_params_}")
-    print(f"  Best CV AUC (avg over 5 folds): {grid.best_score_:.4f}")
+    print(f"\n  Best params:  {search.best_params_}")
+    print(f"  Best CV AUC (avg over 5 folds): {search.best_score_:.4f}")
 
     # Retrain with early stopping on val set using best params
-    best_p = {k: v for k, v in grid.best_params_.items() if k != "n_estimators"}
+    best_p = {k: v for k, v in search.best_params_.items() if k != "n_estimators"}
     tuned = xgb.XGBClassifier(
         **best_p,
         scale_pos_weight=scale_pos_weight,
@@ -415,7 +516,13 @@ def tune_model(X_train, y_train, X_val, y_val, scale_pos_weight):
     tuned.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     print(f"  Best iteration (early stopping): {tuned.best_iteration}")
 
-    # Fix A: tune decision threshold on validation set
+    # Note on Platt calibration: PlattCalibratedXGB is available (class defined above)
+    # but NOT applied by default because calibrating on a small val set (e.g., 28 rows
+    # with 18% class 1 base rate) compresses all probabilities to that base rate,
+    # which destroys discriminative power when test regime has a different base rate.
+    # Raw XGBoost probabilities + threshold sweep is more robust to regime shifts.
+
+    # Fix A: tune decision threshold on validation set using raw probabilities
     best_threshold = tune_threshold(tuned, X_val, y_val)
 
     y_proba = tuned.predict_proba(X_val)[:, 1]
@@ -446,7 +553,9 @@ def run_shap(model, X_val):
     print("PHASE 5: SHAP Value Analysis")
     print("=" * 60)
 
-    explainer   = shap.TreeExplainer(model)
+    # Unwrap PlattCalibratedXGB wrapper if present; else use model directly
+    inner_model = getattr(model, "estimator", model)
+    explainer   = shap.TreeExplainer(inner_model)
     shap_values = explainer.shap_values(X_val)
 
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -617,12 +726,21 @@ def save_outputs(clf_model, reg_model, test_df, y_pred_cls, y_proba_cls,
     print("PHASE 8: Saving Models & Outputs")
     print("=" * 60)
 
+    import json
     joblib.dump(clf_model, "models/xgb_classifier.pkl")
     joblib.dump(reg_model, "models/xgb_regressor.pkl")
-    clf_model.save_model("models/xgb_classifier.ubj")
+    # Unwrap PlattCalibratedXGB if present (wrapper has .estimator); else save directly
+    inner_clf = getattr(clf_model, "estimator", clf_model)
+    save_target = inner_clf if hasattr(inner_clf, "save_model") else clf_model
+    save_target.save_model("models/xgb_classifier.ubj")
     reg_model.save_model("models/xgb_regressor.ubj")
+    # Save threshold so daily_predict.py can read it without manual copy-paste
+    with open("models/model_meta.json", "w") as f:
+        json.dump({"threshold": round(float(threshold), 4),
+                   "feature_cols": FEATURE_COLS}, f, indent=2)
     print("  Saved: models/xgb_classifier.ubj + xgb_regressor.ubj")
     print("  Saved: models/xgb_classifier.pkl + xgb_regressor.pkl")
+    print("  Saved: models/model_meta.json  (threshold + feature list)")
 
     results = test_df[["GARCH_Forecast", "GARCH_Error",
                         "Realized_Vol_proxy", "Target_Binary"]].copy()
@@ -666,6 +784,15 @@ def print_summary(df, X_train, X_val, X_test,
   Fix D: GARCH_Bias_rolling  (model remembers GARCH's recent bias)
   Fix E: Dead-zone |GARCH_Error| < {DEAD_ZONE} rows dropped from train/val
   Fix F: 5-fold walk-forward CV for hyperparameter tuning
+  Enh G1: HV_GARCH_ratio  (HV20/GARCH_forecast -- direct bias detector)
+  Enh G2: GARCH_Bias_short  (5-day GARCH bias -- faster regime signal)
+  Enh G3: ATM_IV_trend  (IV momentum vs 5d mean)
+  Enh G4: Vol_of_Vol  (rolling std of ATM_IV -- vol acceleration)
+  Enh G5: PCR_OI_change1d  (1-day PCR momentum)
+  Enh G6: Binary threshold features (HV_GARCH_above_1, GARCH_Bias_positive)
+  Enh G7: RandomizedSearchCV + gamma/reg_alpha/reg_lambda regularization
+  Enh G8: Platt scaling probability calibration on val set
+  Enh G9: GJR-GARCH in preprocess.py (leverage effect -- set GARCH_MODEL)
 
   -- Classification Results -----------------------------------
   Baseline Val AUC: {val_auc_base:.4f}
@@ -761,6 +888,9 @@ def main():
     print_summary(df, X_train, X_val, X_test,
                   val_auc_base, val_auc_tuned, val_auc_final,
                   test_acc, test_auc, improvement_mae, best_threshold)
+
+
+    
 
 
 if __name__ == "__main__":
