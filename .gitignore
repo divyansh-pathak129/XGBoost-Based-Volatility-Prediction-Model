@@ -1,7 +1,63 @@
-.claude
-vendor/
+# Claude Code
+.claude/
+
+# Model artifacts
 models/
 outputs/
-data/
+
+# Pipeline data (generated — not source)
+data/raw/
+data/processed/
+data/features/
+data/option_chain_raw/
+data/option_chain_processed/
+data/daily_state.json
+
+# Keep the data/ folder structure in git
+!data/.gitkeep
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets / credentials
+.env
+*.env.*
+secrets.json
+credentials.json
+
+# Logs
+*.log
+
+# Excel temp files
+~$*.xlsx
+~$*.xls
