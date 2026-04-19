@@ -68,6 +68,5 @@ credentials.json
 
 # Ignore the specific large data folder
 BANKNIFTY/
-
-# Or, if you want to be extra safe about any CSVs inside it
 BANKNIFTY/*.csv
+!BANKNIFTY/.gitkeep
