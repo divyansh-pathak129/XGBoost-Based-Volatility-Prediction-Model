@@ -70,3 +70,11 @@ credentials.json
 BANKNIFTY/
 BANKNIFTY/*.csv
 !BANKNIFTY/.gitkeep
+
+# Ignore all .md files
+*.md
+
+# Exceptions (Do NOT ignore these)
+!README.md
+!QUICKSTART.md
+!DOCUMENTATION.md
