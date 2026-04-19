@@ -61,3 +61,13 @@ credentials.json
 # Excel temp files
 ~$*.xlsx
 ~$*.xls
+
+# Ignore all Word documents
+*.docx
+*.doc
+
+# Ignore the specific large data folder
+BANKNIFTY/
+
+# Or, if you want to be extra safe about any CSVs inside it
+BANKNIFTY/*.csv
